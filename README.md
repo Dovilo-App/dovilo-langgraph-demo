@@ -1,8 +1,9 @@
 # Dovilo Agentic Demo
 
-Minimal LangGraph workflow that listens for Dovilo webhooks and drives a
-Claude agent to process tasks, reporting progress through the Dovilo MCP
-server running locally (`dovilo-mcp.exe`).
+Minimal LangGraph workflow that listens for [Dovilo](https://dovilo.app)
+webhooks and drives a Claude agent to process tasks, reporting progress
+through the [Dovilo MCP server](https://dovilo.app/ai/) running locally
+(`dovilo-mcp.exe`).
 
 ```
 Dovilo Desktop ──HTTP webhook──▶ FastAPI :8000/webhook
@@ -16,6 +17,14 @@ The orchestrator only relays. The agent owns the lifecycle: claim (`update_statu
 
 Single-file implementation in [main.py](main.py).
 
+## Requirements
+
+- **Python 3.10+** and an [Anthropic API key](https://console.anthropic.com/).
+- **[Dovilo Desktop](https://github.com/slhddn/dovilo-desktop-releases/releases/latest)**
+  — it ships the `dovilo-mcp` binary this demo spawns, so there is nothing
+  separate to install. Desktop is part of Dovilo Pro, which starts with a
+  [7-day free trial](https://dovilo.app/downloads/).
+
 ## Setup
 
 1. **Install dependencies**
@@ -25,8 +34,10 @@ Single-file implementation in [main.py](main.py).
 
 2. **Configure** — copy `.env.example` to `.env`, set `ANTHROPIC_API_KEY` and
    `DOVILO_WEBHOOK_SECRET` (generate one in Dovilo: Project editor → Webhooks
-   → Generate signing secret — plaintext is shown only once). Confirm that
-   [.mcp.json](.mcp.json) points at your local `dovilo-mcp.exe`.
+   → Generate signing secret — plaintext is shown only once; the payload and
+   signature spec is at
+   [dovilo.app/docs/webhooks](https://dovilo.app/docs/webhooks/)). Confirm
+   that [.mcp.json](.mcp.json) points at your local `dovilo-mcp.exe`.
 
 3. **Run** — start the server, then in Dovilo set the webhook URL to
    `http://localhost:8000/webhook` and subscribe to `task.created` and
@@ -64,3 +75,9 @@ verification is active, and the dedup buffer size.
   not for anything else.
 - Status values follow Dovilo's lifecycle: `queued → running →
   awaiting-user → running → done | failed | cancelled`.
+
+---
+
+[Dovilo](https://dovilo.app) · [AI & MCP integration](https://dovilo.app/ai/) ·
+[Webhook docs](https://dovilo.app/docs/webhooks/) ·
+[Desktop releases](https://github.com/slhddn/dovilo-desktop-releases)
