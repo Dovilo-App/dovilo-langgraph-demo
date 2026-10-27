@@ -62,7 +62,7 @@ DOVILO_MCP_URL = os.environ.get("DOVILO_MCP_URL", "https://dovilo.app/mcp/agents
 # signature checks OFF (dev only). Production must set this.
 DOVILO_WEBHOOK_SECRET = os.environ.get("DOVILO_WEBHOOK_SECRET")
 
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-5-5"
 MAX_AGENT_TURNS = 25
 REPLAY_WINDOW_MS = 5 * 60 * 1000  # 5 minutes, per Dovilo spec
 DEDUP_CAP = 1000
@@ -113,7 +113,7 @@ class DoviloMCP:
                 timeout=30.0,
             ))
             transport = streamable_http_client(DOVILO_MCP_URL, http_client=http)
-            # The endpoint speaks the initialize handshake (protocol 2025-06-18).
+            # The endpoint speaks the initialize handshake, not 2026 discovery.
             self._client = await self._stack.enter_async_context(Client(transport, mode="legacy"))
         except Exception as exc:
             await self._stack.aclose()
@@ -246,12 +246,17 @@ async def agent_node(state: WorkflowState) -> dict[str, Any]:
         ]
 
         for turn in range(MAX_AGENT_TURNS):
-            resp = await anthropic.messages.create(
+            resp = await anthropic.beta.messages.create(
                 model=MODEL,
-                max_tokens=1024,
+                # Thinking is on by default and counts toward max_tokens.
+                max_tokens=16000,
                 system=system,
                 tools=tools,
                 messages=messages,
+                # If the model declines on a safety category, the API reruns
+                # the request on a fallback model instead of stopping.
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
             )
             log.info(
                 "[agent] turn %d stop=%s in=%d out=%d cache_r=%d cache_w=%d",
@@ -265,6 +270,8 @@ async def agent_node(state: WorkflowState) -> dict[str, Any]:
             messages.append({"role": "assistant", "content": resp.content})
 
             if resp.stop_reason != "tool_use":
+                if resp.stop_reason != "end_turn":
+                    log.warning("[agent] stopped early (%s) on task %s", resp.stop_reason, task.get("id"))
                 break
 
             tool_results: list[dict[str, Any]] = []
