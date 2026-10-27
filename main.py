@@ -58,8 +58,8 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 # The agent's key: created in Dovilo (AI Agents > New agent), shown once.
 DOVILO_AGENT_KEY = os.environ.get("DOVILO_AGENT_KEY")
 DOVILO_MCP_URL = os.environ.get("DOVILO_MCP_URL", "https://dovilo.app/mcp/agents")
-# Per-project signing secret from the Dovilo UI. If unset we run with
-# signature checks OFF (dev only). Production must set this.
+# Signing secret of the project's webhook, from the Dovilo UI. If unset,
+# every webhook is rejected: the receiver is meant to be reachable publicly.
 DOVILO_WEBHOOK_SECRET = os.environ.get("DOVILO_WEBHOOK_SECRET")
 
 MODEL = "claude-sonnet-5-5"
@@ -73,8 +73,8 @@ if not DOVILO_AGENT_KEY:
     raise RuntimeError("DOVILO_AGENT_KEY is required (set it in .env)")
 if not DOVILO_WEBHOOK_SECRET:
     log.warning(
-        "DOVILO_WEBHOOK_SECRET is not set - signature verification DISABLED. "
-        "Acceptable for local dev, not for anything else."
+        "DOVILO_WEBHOOK_SECRET is not set - every webhook will be rejected "
+        "with 401. Queued tasks are still picked up at startup."
     )
 
 anthropic = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
@@ -115,14 +115,14 @@ class DoviloMCP:
             transport = streamable_http_client(DOVILO_MCP_URL, http_client=http)
             # The endpoint speaks the initialize handshake, not 2026 discovery.
             self._client = await self._stack.enter_async_context(Client(transport, mode="legacy"))
-        except Exception as exc:
+        except BaseException as exc:  # incl. cancellation: close what was opened
             await self._stack.aclose()
             self._raise_if_rejected(exc)
             raise
         return self
 
-    async def __aexit__(self, *exc_info: Any) -> None:
-        await self._stack.aclose()
+    async def __aexit__(self, *exc_info: Any) -> Optional[bool]:
+        return await self._stack.__aexit__(*exc_info)
 
     async def _keep_401_message(self, response: httpx2.Response) -> None:
         if response.status_code != 401:
@@ -133,7 +133,7 @@ class DoviloMCP:
         except (ValueError, KeyError, TypeError):
             self._rejected = f"HTTP 401 from {DOVILO_MCP_URL}"
 
-    def _raise_if_rejected(self, exc: Exception) -> None:
+    def _raise_if_rejected(self, exc: BaseException) -> None:
         if self._rejected:
             raise DoviloAuthError(self._rejected) from exc
 
@@ -146,7 +146,11 @@ class DoviloMCP:
     async def tool_schemas(self) -> list[dict[str, Any]]:
         """The server's tools in Anthropic `tools` format."""
         assert self._client is not None, "MCP connection not open"
-        listed = await self._client.list_tools()
+        try:
+            listed = await self._client.list_tools()
+        except Exception as exc:
+            self._raise_if_rejected(exc)
+            raise
         return [
             {"name": t.name, "description": t.description or "", "input_schema": t.input_schema}
             for t in listed.tools
@@ -240,6 +244,8 @@ async def agent_node(state: WorkflowState) -> dict[str, Any]:
         system: list[dict[str, Any]] = [{"type": "text", "text": _SYSTEM_PROMPT}]
         if dovilo.instructions:
             system.append({"type": "text", "text": dovilo.instructions})
+        else:
+            log.warning("[agent] %s sent no agent protocol; the prompt refers to one", DOVILO_MCP_URL)
         system[-1] = {**system[-1], "cache_control": {"type": "ephemeral"}}
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": _build_user_message(task, state.get("project_name"))}
@@ -253,8 +259,8 @@ async def agent_node(state: WorkflowState) -> dict[str, Any]:
                 system=system,
                 tools=tools,
                 messages=messages,
-                # If the model declines on a safety category, the API reruns
-                # the request on a fallback model instead of stopping.
+                # For some refusal categories the API reruns the request on a
+                # fallback model instead of stopping.
                 betas=["server-side-fallback-2026-07-01"],
                 fallbacks="default",
             )
@@ -282,6 +288,8 @@ async def agent_node(state: WorkflowState) -> dict[str, Any]:
                 try:
                     result = await dovilo.call_tool(block.name, block.input)
                     content, is_error = _result_text(result), result.is_error
+                    if block.name == "update_status" and not is_error:
+                        _remember_own_status(block.input)
                 except DoviloAuthError:
                     raise
                 except MCPError as exc:
@@ -317,6 +325,17 @@ GRAPH = _build_graph()
 
 # In-memory mirror of the latest status, updated by inbound webhooks only.
 TASK_STATE: dict[str, str] = {}
+# The status an agent run last set, by task id. The webhook that echoes it
+# back must not be read as the user's doing: an agent handing a task back
+# (`queued`) is not a new task to pick up, and its own cancel is not a
+# reason to stop its run.
+_OWN_STATUS: dict[str, str] = {}
+
+
+def _remember_own_status(args: dict[str, Any]) -> None:
+    status = args.get("status")
+    # `cancelled` is stored as `error` with `cancelledAt`.
+    _OWN_STATUS[args.get("id", "")] = "error" if status == "cancelled" else status
 # Tool names seen at startup, for /health.
 MCP_TOOLS: list[str] = []
 
@@ -380,7 +399,12 @@ async def _bootstrap_sync() -> None:
         log.info("[dovilo-mcp] %s - tools: %s", DOVILO_MCP_URL, MCP_TOOLS)
         result = await dovilo.call_tool("list_tasks", {"status": "queued"})
 
-    data = result.structured_content or {}
+    if result.is_error:
+        log.warning("[bootstrap] list_tasks returned an error: %s", _result_text(result)[:300])
+        return
+    data = result.structured_content
+    if data is None:
+        data = json.loads(_result_text(result))
     tasks = data.get("tasks") or []
     projects = {p["id"]: p.get("name") for p in data.get("scopedProjects") or []}
     log.info("[bootstrap] %d queued task(s) in %d project(s)", len(tasks), len(projects))
@@ -394,9 +418,9 @@ async def _bootstrap_sync() -> None:
 # Webhook security: HMAC-SHA256 over `{t}.{rawBody}` + replay window
 # ---------------------------------------------------------------------------
 def verify_signature(sig_header: str, raw_body: bytes) -> bool:
-    """Validate X-Dovilo-Signature. Returns True if secret is unset (dev mode)."""
+    """Validate X-Dovilo-Signature. Without a secret nothing can be verified, so nothing passes."""
     if not DOVILO_WEBHOOK_SECRET:
-        return True
+        return False
 
     parts: dict[str, str] = {}
     for piece in sig_header.split(","):
@@ -450,9 +474,12 @@ async def lifespan(_: FastAPI):
     try:
         await _bootstrap_sync()
     except DoviloAuthError as exc:
-        # A configuration error, not a crash: show Dovilo's message, no traceback.
+        # A configuration error: stop with Dovilo's message, not the exception chain.
         log.error("[dovilo-mcp] %s rejected the agent key: %s", DOVILO_MCP_URL, exc)
         raise SystemExit(1) from None
+    except Exception:
+        # Anything else (network, server) should not take the receiver down.
+        log.exception("[bootstrap] startup sync failed; webhooks are still served")
     yield
 
 
@@ -517,19 +544,21 @@ async def webhook(req: Request):
             log.info("[webhook] task %s opens to the agent at %s", task_id, _fmt_ms(task.get("scheduledAt")))
         return {"ok": True, "task_id": task_id, "status": status}
 
-    log.info("[webhook] task.status_changed id=%s %s -> %s", task_id, previous, status)
+    own = _OWN_STATUS.get(task_id) == status
+    if own:
+        del _OWN_STATUS[task_id]
+    log.info("[webhook] task.status_changed id=%s %s -> %s%s", task_id, previous, status, " (agent)" if own else "")
 
     # A task opens to the agent when it becomes `queued`: from `scheduled` when
     # its time comes, from `awaiting-user` when the user answers or approves
-    # the plan, or after Retry in the app. `running` -> `queued` is an agent
-    # handing the task back; picking it straight up again could loop, so it
-    # waits for the next startup sync.
-    if status == "queued" and previous != "running":
+    # the plan, after Retry or Release in the app. Not when the agent itself
+    # handed it back: picking it straight up again could loop.
+    if status == "queued" and not own:
         start_run(task, project_name, rerun_if_busy=True)
         return JSONResponse(status_code=202, content={"ok": True, "queued": task_id})
 
     # There is no `cancelled` status: a cancelled task is `error` + `cancelledAt`.
-    if status == "error" and task.get("cancelledAt"):
+    if status == "error" and task.get("cancelledAt") and not own:
         log.info("[webhook] task %s was cancelled", task_id)
         cancel_run(task_id)
 

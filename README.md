@@ -90,13 +90,15 @@ Single-file implementation in [main.py](main.py).
     processing happens in the background).
   - `task.status_changed` to `queued` starts a run: a scheduled task whose
     time has come (`scheduled` to `queued`), a question the user answered or
-    a plan they approved (`awaiting-user` to `queued`), or a Retry in the
-    app.
+    a plan they approved (`awaiting-user` to `queued`), or a Retry or
+    Release in the app. A task the agent itself handed back is not picked
+    up again.
   - A task created for a later time arrives as `scheduled`. The demo logs
     it and waits: the agent cannot read a scheduled task until Dovilo
     queues it.
-  - A cancelled task arrives as `error` with `cancelledAt`. If an agent run
-    is working that task, the demo stops it.
+  - A cancelled task arrives as `error` with `cancelledAt`. If the user
+    cancelled it while an agent run is working on it, the demo stops the
+    run.
   - Other status changes, including the agent's own `update_status` calls
     round-tripping back, are logged.
 - **Agent run**: opens its own connection to the Agents MCP (the endpoint
@@ -113,9 +115,15 @@ buffer size.
 
 ## Notes
 
-- If `DOVILO_WEBHOOK_SECRET` is missing, signature verification is **off**
-  and a loud warning is logged at startup. Fine for local development,
-  not for anything else.
+- If `DOVILO_WEBHOOK_SECRET` is missing, every webhook is rejected with
+  `401` and a warning is logged at startup. Queued tasks are still picked up
+  when the demo starts.
+- One receiver checks one signing secret, so it serves one project's
+  webhook. If the agent works several projects, the startup sync covers all
+  of them; for webhooks from each, run one receiver per project.
+- `.env` and `.mcp.json` are no longer tracked. If you cloned an earlier
+  version of this demo, move your `.env` aside before you pull, then copy
+  `.env.example` to `.env` and add your agent key.
 - Statuses: `scheduled`, `queued`, `running`, `awaiting-user`, `done`,
   `done-with-errors`, `error`. There is no `cancelled` status: a cancelled
   task is stored as `error` with `cancelledAt` and shown as Cancelled.
