@@ -67,8 +67,9 @@ Single-file implementation in [main.py](main.py).
 5. **Add a webhook** so new tasks reach the demo without a restart. Dovilo's
    server delivers to public HTTPS URLs, so expose port 8000 with a tunnel
    (for example cloudflared or ngrok) and use
-   `https://<your-tunnel-host>/webhook`. Webhooks are set up in Dovilo
-   Desktop 2.0 or later: open the project's List settings, find Webhooks,
+   `https://<your-tunnel-host>/webhook`. Webhooks are set up in
+   [Dovilo Desktop](https://github.com/Dovilo-App/dovilo-desktop-releases/releases/latest)
+   2.0 or later: open the project's List settings, find Webhooks,
    paste the URL, tick `task.created` and `task.status_changed`, switch it to
    Enabled and save. Press Generate signing secret (shown once), put it in
    `.env` as `DOVILO_WEBHOOK_SECRET`, restart the demo and press Send test.
@@ -136,4 +137,5 @@ buffer size.
 ---
 
 [Dovilo](https://dovilo.app) · [AI & MCP integration](https://dovilo.app/ai/) ·
-[Webhook docs](https://dovilo.app/docs/webhooks/)
+[Webhook docs](https://dovilo.app/docs/webhooks/) ·
+[Desktop releases](https://github.com/Dovilo-App/dovilo-desktop-releases)
