@@ -2,16 +2,18 @@
 Dovilo webhooks <-> agentic LangGraph workflow.
 
 Architecture:
-  Dovilo Desktop ──HTTP webhook──▶ FastAPI :8000/webhook   (incoming)
-         ▲
-         └── stdio MCP ── this app spawns dovilo-mcp.exe and exposes its
-                          tool schemas to Claude as `tools`. Claude calls
-                          them itself via tool_use.
+  Dovilo ──signed HTTPS webhook──▶ FastAPI :8000/webhook   (incoming)
+     ▲
+     └── Agents MCP ── https://dovilo.app/mcp/agents over Streamable HTTP,
+                       authenticated with the agent's key. Each agent run
+                       opens a connection and exposes its tool schemas to
+                       Claude as `tools`. Claude calls them itself via
+                       tool_use.
 
 The orchestrator's only job is to receive (verified) webhooks and wake the
-agent. The agent owns the task lifecycle — it decides when to add notes,
-mark steps, fetch full task body via get_task, and finalize the task with
-update_status. The host process does not intervene.
+agent when a task opens to it (status `queued`). The agent owns the task
+lifecycle: it reads the task, claims it, writes steps and notes, and
+finalizes it with update_status. The host process does not intervene.
 
 Webhook security follows the Dovilo spec: HMAC-SHA256 over `{t}.{rawBody}`,
 5-minute replay window, deduplication via X-Dovilo-Delivery.
@@ -28,17 +30,18 @@ import os
 import time
 from collections import deque
 from contextlib import AsyncExitStack, asynccontextmanager
-from pathlib import Path
 from typing import Any, Optional, TypedDict
 
+import httpx2
 import uvicorn
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from langgraph.graph import END, StateGraph
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp import Client, MCPError
+from mcp.client.streamable_http import streamable_http_client
+from mcp.types import CallToolResult
 
 # ---------------------------------------------------------------------------
 # Config
@@ -52,81 +55,115 @@ logging.basicConfig(
 log = logging.getLogger("dovilo-demo")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-DOVILO_MCP_CONFIG = Path(os.environ.get("DOVILO_MCP_CONFIG", ".mcp.json"))
-DOVILO_MCP_SERVER_NAME = os.environ.get("DOVILO_MCP_SERVER_NAME", "Dovilo")
-# Per-project signing secret from the Dovilo UI. If unset we run with
-# signature checks OFF (dev only). Production must set this.
+# The agent's key: created in Dovilo (AI Agents > New agent), shown once.
+DOVILO_AGENT_KEY = os.environ.get("DOVILO_AGENT_KEY")
+DOVILO_MCP_URL = os.environ.get("DOVILO_MCP_URL", "https://dovilo.app/mcp/agents")
+# Signing secret of the project's webhook, from the Dovilo UI. If unset,
+# every webhook is rejected: the receiver is meant to be reachable publicly.
 DOVILO_WEBHOOK_SECRET = os.environ.get("DOVILO_WEBHOOK_SECRET")
 
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-5-5"
 MAX_AGENT_TURNS = 25
 REPLAY_WINDOW_MS = 5 * 60 * 1000  # 5 minutes, per Dovilo spec
 DEDUP_CAP = 1000
 
 if not ANTHROPIC_API_KEY:
     raise RuntimeError("ANTHROPIC_API_KEY is required (set it in .env)")
+if not DOVILO_AGENT_KEY:
+    raise RuntimeError("DOVILO_AGENT_KEY is required (set it in .env)")
 if not DOVILO_WEBHOOK_SECRET:
     log.warning(
-        "DOVILO_WEBHOOK_SECRET is not set - signature verification DISABLED. "
-        "Acceptable for local dev, not for anything else."
+        "DOVILO_WEBHOOK_SECRET is not set - every webhook will be rejected "
+        "with 401. Queued tasks are still picked up at startup."
     )
 
 anthropic = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 
 # ---------------------------------------------------------------------------
-# Dovilo MCP client
+# Dovilo Agents MCP client
 # ---------------------------------------------------------------------------
-class DoviloMCPClient:
-    """Long-lived stdio MCP session. Exposes tool schemas in Anthropic format."""
+class DoviloAuthError(RuntimeError):
+    """The Agents MCP rejected the key. The message is Dovilo's, meant for the user as-is."""
 
-    def __init__(self, config_path: Path, server_name: str) -> None:
-        self.config_path = config_path
-        self.server_name = server_name
-        self._stack: Optional[AsyncExitStack] = None
-        self._session: Optional[ClientSession] = None
-        self.tool_schemas: list[dict[str, Any]] = []
 
-    def _server_params(self) -> StdioServerParameters:
-        cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
-        server_cfg = cfg["mcpServers"][self.server_name]
-        return StdioServerParameters(
-            command=server_cfg["command"],
-            args=server_cfg.get("args") or [],
-            env={**os.environ, **(server_cfg.get("env") or {})},
-        )
+class DoviloMCP:
+    """One connection to the Dovilo Agents MCP.
 
-    async def start(self) -> None:
-        params = self._server_params()
+    The endpoint is stateless Streamable HTTP: every request is a POST answered
+    with JSON, and there is no SSE stream to hold open. So nothing is shared
+    between agent runs; each run opens its own connection.
+
+    A missing, wrong or revoked key gets HTTP 401 with a JSON body whose
+    `message` tells the user what to do. The MCP SDK only reports a generic
+    error, so a response hook keeps that message and it is raised as
+    DoviloAuthError.
+    """
+
+    def __init__(self) -> None:
         self._stack = AsyncExitStack()
-        read, write = await self._stack.enter_async_context(stdio_client(params))
-        self._session = await self._stack.enter_async_context(ClientSession(read, write))
-        await self._session.initialize()
-        tools_resp = await self._session.list_tools()
-        self.tool_schemas = [
-            {
-                "name": t.name,
-                "description": t.description or "",
-                "input_schema": t.inputSchema,
-            }
-            for t in tools_resp.tools
-        ]
-        log.info("[dovilo-mcp] connected - tools: %s", [t["name"] for t in self.tool_schemas])
+        self._client: Optional[Client] = None
+        self._rejected: Optional[str] = None
 
-    async def stop(self) -> None:
-        if self._stack is not None:
+    async def __aenter__(self) -> DoviloMCP:
+        try:
+            http = await self._stack.enter_async_context(httpx2.AsyncClient(
+                headers={"Authorization": f"Bearer {DOVILO_AGENT_KEY}"},
+                event_hooks={"response": [self._keep_401_message]},
+                timeout=30.0,
+            ))
+            transport = streamable_http_client(DOVILO_MCP_URL, http_client=http)
+            # The endpoint speaks the initialize handshake, not 2026 discovery.
+            self._client = await self._stack.enter_async_context(Client(transport, mode="legacy"))
+        except BaseException as exc:  # incl. cancellation: close what was opened
             await self._stack.aclose()
-            self._stack = None
-            self._session = None
+            self._raise_if_rejected(exc)
+            raise
+        return self
 
-    async def call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
-        assert self._session is not None, "MCP session not started"
-        result = await self._session.call_tool(name, args)
-        text = "\n".join(getattr(c, "text", str(c)) for c in result.content) or "(no content)"
-        return {"content": text, "is_error": bool(result.isError)}
+    async def __aexit__(self, *exc_info: Any) -> Optional[bool]:
+        return await self._stack.__aexit__(*exc_info)
 
+    async def _keep_401_message(self, response: httpx2.Response) -> None:
+        if response.status_code != 401:
+            return
+        await response.aread()
+        try:
+            self._rejected = response.json()["message"]
+        except (ValueError, KeyError, TypeError):
+            self._rejected = f"HTTP 401 from {DOVILO_MCP_URL}"
 
-dovilo = DoviloMCPClient(DOVILO_MCP_CONFIG, DOVILO_MCP_SERVER_NAME)
+    def _raise_if_rejected(self, exc: BaseException) -> None:
+        if self._rejected:
+            raise DoviloAuthError(self._rejected) from exc
+
+    @property
+    def instructions(self) -> str:
+        """The Dovilo agent protocol, as the server sends it on initialize."""
+        assert self._client is not None, "MCP connection not open"
+        return self._client.instructions or ""
+
+    async def tool_schemas(self) -> list[dict[str, Any]]:
+        """The server's tools in Anthropic `tools` format."""
+        assert self._client is not None, "MCP connection not open"
+        try:
+            listed = await self._client.list_tools()
+        except Exception as exc:
+            self._raise_if_rejected(exc)
+            raise
+        return [
+            {"name": t.name, "description": t.description or "", "input_schema": t.input_schema}
+            for t in listed.tools
+        ]
+
+    async def call_tool(self, name: str, args: dict[str, Any]) -> CallToolResult:
+        """Call one tool. A Dovilo domain error raises MCPError with `data.domainCode`."""
+        assert self._client is not None, "MCP connection not open"
+        try:
+            return await self._client.call_tool(name, args)
+        except Exception as exc:
+            self._raise_if_rejected(exc)
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -138,46 +175,37 @@ def _fmt_ms(ms: Optional[int]) -> str:
     return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ms / 1000))
 
 
-def _tools_for_claude() -> list[dict[str, Any]]:
-    """Tools array with cache_control on the last entry to cache the whole block."""
-    tools = [dict(t) for t in dovilo.tool_schemas]
-    if tools:
-        tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
-    return tools
+def _result_text(result: CallToolResult) -> str:
+    text = "\n".join(getattr(c, "text", str(c)) for c in result.content)
+    if not text and result.structured_content is not None:
+        text = json.dumps(result.structured_content)
+    return text or "(no content)"
 
 
 # ---------------------------------------------------------------------------
 # The contract
 # ---------------------------------------------------------------------------
-# This is the protocol handed to the agent. Status values match Dovilo's
-# lifecycle: queued → running → awaiting-user → running → done|failed|cancelled.
+# Framing for this host. The protocol itself (read, claim, steps, notes,
+# finish) comes from the server's `instructions`, so it stays in step with
+# Dovilo instead of being copied here.
 _SYSTEM_PROMPT = (
-    "You are an agent operating inside Dovilo, a productivity app. A task has "
-    "been assigned to you. You have access to MCP tools to inspect tasks, "
-    "report progress, and finalize. You own the entire lifecycle — the host "
-    "process will not intervene.\n\n"
-    "Protocol you must follow:\n"
-    "1. The user message gives you the slim task fields delivered by webhook "
-    "(id, text/title, status, priority, dueAt, projectName). If you need the "
-    "full body (description, context, steps, prior agent notes), call "
-    "`get_task` with the task id first.\n"
-    "2. Claim the task by calling `update_status` with status='running'.\n"
-    "3. Work the task. Call `append_note` with concise (1-3 sentence) progress "
-    "notes — that is how the user sees what you did.\n"
-    "4. If the task has explicit steps (visible via get_task), call "
-    "`update_step` to mark each as 'in_progress' when you start and "
-    "'completed' when you finish.\n"
-    "5. Finalize — always — with `update_status`, using one of:\n"
-    "   • 'done'      — the task is fully addressed.\n"
-    "   • 'failed'    — you cannot proceed. Append a note explaining why FIRST.\n"
-    "   • 'cancelled' — the work no longer makes sense (e.g. duplicate task).\n\n"
-    "Rules: be concise; don't fabricate results — if external research is "
-    "needed, summarize what you would investigate and what you'd expect to "
-    "find, then finalize. Never leave the task in a non-terminal status."
+    "You are an agent working one Dovilo AI task. Dovilo is a task app: the "
+    "user writes a task in a project, and an agent like you works it through "
+    "the Dovilo MCP tools. You own the task's lifecycle; the host process "
+    "will not intervene.\n\n"
+    "The user message names your task and the slim fields its webhook "
+    "carried. Skip step 0 of the Dovilo agent protocol below and start at "
+    "step 1 with that task id. Read before you claim, and do not claim a "
+    "task you will not work.\n\n"
+    "Rules: be concise. Your only tools are Dovilo's, so don't claim to have "
+    "browsed, run code or checked sources. If the task needs that, do what "
+    "you can from what you know, say plainly in a note what you could not "
+    "do, and finish with the status that fits. Never leave the task in "
+    "`running`."
 )
 
 
-def _build_user_message(task: dict[str, Any]) -> str:
+def _build_user_message(task: dict[str, Any], project_name: Optional[str]) -> str:
     """Render the slim webhook task into a readable prompt."""
     lines = [
         f"Task ID: {task.get('id')}",
@@ -188,15 +216,12 @@ def _build_user_message(task: dict[str, Any]) -> str:
         lines.append(f"Priority: {task['priority']}")
     if task.get("importance"):
         lines.append("Starred: yes")
-    if task.get("dueAt"):
-        lines.append(f"Due: {_fmt_ms(task.get('dueAt'))}")
-    if task.get("projectName"):
-        lines.append(f"Project: {task['projectName']}")
+    if task.get("isRecurring"):
+        lines.append(f"Repeats: {task.get('recurrenceType') or 'yes'}")
+    if project_name:
+        lines.append(f"Project: {project_name}")
     lines.append("")
-    lines.append(
-        "Call `get_task` with this task id if you need the description, "
-        "context, steps, or prior notes. Begin."
-    )
+    lines.append("Start with `read_context` for this task id. Begin.")
     return "\n".join(lines)
 
 
@@ -205,57 +230,85 @@ def _build_user_message(task: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 class WorkflowState(TypedDict):
     task: dict[str, Any]
+    project_name: Optional[str]
 
 
 async def agent_node(state: WorkflowState) -> dict[str, Any]:
-    """Run Claude in a tool_use loop. The agent finalizes per the protocol."""
+    """Run Claude in a tool_use loop over its own Agents MCP connection."""
     task = state["task"]
-    messages: list[dict[str, Any]] = [{"role": "user", "content": _build_user_message(task)}]
-    system = [{"type": "text", "text": _SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
-    tools = _tools_for_claude()
+    async with DoviloMCP() as dovilo:
+        # cache_control on the last tool and the last system block caches both.
+        tools = await dovilo.tool_schemas()
+        if tools:
+            tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+        system: list[dict[str, Any]] = [{"type": "text", "text": _SYSTEM_PROMPT}]
+        if dovilo.instructions:
+            system.append({"type": "text", "text": dovilo.instructions})
+        else:
+            log.warning("[agent] %s sent no agent protocol; the prompt refers to one", DOVILO_MCP_URL)
+        system[-1] = {**system[-1], "cache_control": {"type": "ephemeral"}}
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": _build_user_message(task, state.get("project_name"))}
+        ]
 
-    for turn in range(MAX_AGENT_TURNS):
-        resp = await anthropic.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            system=system,
-            tools=tools,
-            messages=messages,
-        )
-        log.info(
-            "[agent] turn %d stop=%s in=%d out=%d cache_r=%d cache_w=%d",
-            turn + 1,
-            resp.stop_reason,
-            resp.usage.input_tokens,
-            resp.usage.output_tokens,
-            getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
-            getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
-        )
-        messages.append({"role": "assistant", "content": resp.content})
+        for turn in range(MAX_AGENT_TURNS):
+            resp = await anthropic.beta.messages.create(
+                model=MODEL,
+                # Thinking is on by default and counts toward max_tokens.
+                max_tokens=16000,
+                system=system,
+                tools=tools,
+                messages=messages,
+                # For some refusal categories the API reruns the request on a
+                # fallback model instead of stopping.
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
+            )
+            log.info(
+                "[agent] turn %d stop=%s in=%d out=%d cache_r=%d cache_w=%d",
+                turn + 1,
+                resp.stop_reason,
+                resp.usage.input_tokens,
+                resp.usage.output_tokens,
+                getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
+                getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
+            )
+            messages.append({"role": "assistant", "content": resp.content})
 
-        if resp.stop_reason != "tool_use":
-            break
+            if resp.stop_reason != "tool_use":
+                if resp.stop_reason != "end_turn":
+                    log.warning("[agent] stopped early (%s) on task %s", resp.stop_reason, task.get("id"))
+                break
 
-        tool_results: list[dict[str, Any]] = []
-        for block in resp.content:
-            if getattr(block, "type", None) != "tool_use":
-                continue
-            log.info("[agent] → %s(%s)", block.name, json.dumps(block.input))
-            try:
-                result = await dovilo.call_tool(block.name, block.input)
-                content, is_error = result["content"], result["is_error"]
-            except Exception as exc:  # noqa: BLE001 - surface to the model as a tool error
-                log.exception("[agent] tool %s raised", block.name)
-                content, is_error = f"Tool error: {exc}", True
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": content,
-                "is_error": is_error,
-            })
-        messages.append({"role": "user", "content": tool_results})
-    else:
-        log.warning("[agent] hit MAX_AGENT_TURNS=%d for task %s", MAX_AGENT_TURNS, task.get("id"))
+            tool_results: list[dict[str, Any]] = []
+            for block in resp.content:
+                if getattr(block, "type", None) != "tool_use":
+                    continue
+                log.info("[agent] → %s(%s)", block.name, json.dumps(block.input))
+                try:
+                    result = await dovilo.call_tool(block.name, block.input)
+                    content, is_error = _result_text(result), result.is_error
+                    if block.name == "update_status" and not is_error:
+                        _remember_own_status(block.input)
+                except DoviloAuthError:
+                    raise
+                except MCPError as exc:
+                    # Dovilo's domain errors (TASK_ALREADY_CLAIMED,
+                    # FORBIDDEN_OPERATION, ...) carry `data.domainCode`.
+                    log.info("[agent] %s: %s %s", block.name, exc.message, exc.data)
+                    content, is_error = json.dumps({"error": exc.message, "data": exc.data}), True
+                except Exception as exc:  # noqa: BLE001 - surface to the model as a tool error
+                    log.exception("[agent] tool %s raised", block.name)
+                    content, is_error = f"Tool error: {exc}", True
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": content,
+                    "is_error": is_error,
+                })
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            log.warning("[agent] hit MAX_AGENT_TURNS=%d for task %s", MAX_AGENT_TURNS, task.get("id"))
 
     return {}
 
@@ -272,88 +325,102 @@ GRAPH = _build_graph()
 
 # In-memory mirror of the latest status, updated by inbound webhooks only.
 TASK_STATE: dict[str, str] = {}
+# The status an agent run last set, by task id. The webhook that echoes it
+# back must not be read as the user's doing: an agent handing a task back
+# (`queued`) is not a new task to pick up, and its own cancel is not a
+# reason to stop its run.
+_OWN_STATUS: dict[str, str] = {}
 
 
-async def run_workflow(task: dict[str, Any]) -> None:
+def _remember_own_status(args: dict[str, Any]) -> None:
+    status = args.get("status")
+    # `cancelled` is stored as `error` with `cancelledAt`.
+    _OWN_STATUS[args.get("id", "")] = "error" if status == "cancelled" else status
+# Tool names seen at startup, for /health.
+MCP_TOOLS: list[str] = []
+
+
+async def run_workflow(task: dict[str, Any], project_name: Optional[str]) -> None:
     """Wake the agent for one task. Crashes are logged; no recovery."""
     try:
-        await GRAPH.ainvoke({"task": task})
+        await GRAPH.ainvoke({"task": task, "project_name": project_name})
+    except asyncio.CancelledError:
+        log.info("[workflow] stopped for task %s", task.get("id"))
+        raise
+    except DoviloAuthError as exc:
+        log.error("[workflow] Dovilo rejected the agent key: %s", exc)
     except Exception:
         log.exception("[workflow] crashed for task %s", task.get("id"))
 
 
 # ---------------------------------------------------------------------------
-# Startup sync — fetch pending tasks once at boot
+# Agent runs: one per task, stopped when the task is cancelled
 # ---------------------------------------------------------------------------
-# Per Dovilo lifecycle: only 'queued' tasks are un-claimed and worth picking up.
-_PENDING_STATUSES = {"queued"}
+_RUNS: dict[str, asyncio.Task[None]] = {}
+# Tasks that went back to `queued` while their previous run was still ending
+# (e.g. the user answered the agent's question within seconds).
+_RERUN: dict[str, tuple[dict[str, Any], Optional[str]]] = {}
 
 
-def _find_list_tasks_tool() -> Optional[str]:
-    override = os.environ.get("DOVILO_LIST_TASKS_TOOL")
-    if override:
-        return override
-    # Per the public docs, the canonical tool is `list_tasks`. Be lenient if
-    # the server renames it.
-    for t in dovilo.tool_schemas:
-        n = t["name"].lower()
-        if "task" in n and any(verb in n for verb in ("list", "query", "fetch", "search")):
-            return t["name"]
-    return None
+def start_run(task: dict[str, Any], project_name: Optional[str], *, rerun_if_busy: bool) -> None:
+    task_id = task["id"]
+    if task_id in _RUNS:
+        if rerun_if_busy:
+            _RERUN[task_id] = (task, project_name)
+        log.info("[runs] task %s already has a run in flight", task_id)
+        return
+    run = asyncio.create_task(run_workflow(task, project_name))
+    _RUNS[task_id] = run
+    run.add_done_callback(lambda _: _run_finished(task_id))
 
 
-def _extract_tasks(content: str) -> list[dict[str, Any]]:
-    """Pull a list of task dicts out of an MCP tool result body."""
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        return []
-    if isinstance(data, list):
-        return [t for t in data if isinstance(t, dict) and t.get("id")]
-    if isinstance(data, dict):
-        for key in ("tasks", "items", "data", "results"):
-            v = data.get(key)
-            if isinstance(v, list):
-                return [t for t in v if isinstance(t, dict) and t.get("id")]
-        if data.get("id"):
-            return [data]
-    return []
+def _run_finished(task_id: str) -> None:
+    _RUNS.pop(task_id, None)
+    pending = _RERUN.pop(task_id, None)
+    if pending:
+        start_run(*pending, rerun_if_busy=False)
 
 
+def cancel_run(task_id: str) -> None:
+    _RERUN.pop(task_id, None)
+    run = _RUNS.get(task_id)
+    if run is not None:
+        log.info("[runs] stopping the agent run for task %s", task_id)
+        run.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Startup sync: check the key and fetch queued tasks once at boot
+# ---------------------------------------------------------------------------
 async def _bootstrap_sync() -> None:
-    """One-shot startup sync: fetch pending tasks and queue each for the agent."""
-    tool_name = _find_list_tasks_tool()
-    if not tool_name:
-        log.info("[bootstrap] no list-tasks tool detected; skipping startup sync")
+    """Connect once: fail fast on a bad key, then queue each queued task for the agent."""
+    async with DoviloMCP() as dovilo:
+        MCP_TOOLS[:] = [t["name"] for t in await dovilo.tool_schemas()]
+        log.info("[dovilo-mcp] %s - tools: %s", DOVILO_MCP_URL, MCP_TOOLS)
+        result = await dovilo.call_tool("list_tasks", {"status": "queued"})
+
+    if result.is_error:
+        log.warning("[bootstrap] list_tasks returned an error: %s", _result_text(result)[:300])
         return
+    data = result.structured_content
+    if data is None:
+        data = json.loads(_result_text(result))
+    tasks = data.get("tasks") or []
+    projects = {p["id"]: p.get("name") for p in data.get("scopedProjects") or []}
+    log.info("[bootstrap] %d queued task(s) in %d project(s)", len(tasks), len(projects))
 
-    log.info("[bootstrap] fetching tasks via %s", tool_name)
-    try:
-        result = await dovilo.call_tool(tool_name, {})
-    except Exception:
-        log.exception("[bootstrap] %s call failed", tool_name)
-        return
-
-    if result["is_error"]:
-        log.warning("[bootstrap] %s returned error: %s", tool_name, result["content"][:300])
-        return
-
-    tasks = _extract_tasks(result["content"])
-    pending = [t for t in tasks if (t.get("status") or "").lower() in _PENDING_STATUSES]
-    log.info("[bootstrap] %d task(s) returned, %d queued", len(tasks), len(pending))
-
-    for task in pending:
+    for task in tasks:
         TASK_STATE[task["id"]] = task.get("status") or "queued"
-        asyncio.create_task(run_workflow(task))
+        start_run(task, projects.get(task.get("listId")), rerun_if_busy=False)
 
 
 # ---------------------------------------------------------------------------
 # Webhook security: HMAC-SHA256 over `{t}.{rawBody}` + replay window
 # ---------------------------------------------------------------------------
 def verify_signature(sig_header: str, raw_body: bytes) -> bool:
-    """Validate X-Dovilo-Signature. Returns True if secret is unset (dev mode)."""
+    """Validate X-Dovilo-Signature. Without a secret nothing can be verified, so nothing passes."""
     if not DOVILO_WEBHOOK_SECRET:
-        return True
+        return False
 
     parts: dict[str, str] = {}
     for piece in sig_header.split(","):
@@ -404,22 +471,27 @@ def remember_delivery(delivery_id: str) -> bool:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await dovilo.start()
-    asyncio.create_task(_bootstrap_sync())
     try:
-        yield
-    finally:
-        await dovilo.stop()
+        await _bootstrap_sync()
+    except DoviloAuthError as exc:
+        # A configuration error: stop with Dovilo's message, not the exception chain.
+        log.error("[dovilo-mcp] %s rejected the agent key: %s", DOVILO_MCP_URL, exc)
+        raise SystemExit(1) from None
+    except Exception:
+        # Anything else (network, server) should not take the receiver down.
+        log.exception("[bootstrap] startup sync failed; webhooks are still served")
+    yield
 
 
 app = FastAPI(title="Dovilo LangGraph Demo", lifespan=lifespan)
 
 
 @app.post("/webhook")
-async def webhook(req: Request, bg: BackgroundTasks):
+async def webhook(req: Request):
     raw_body = await req.body()
 
-    # 1) Verify signature on the raw bytes BEFORE parsing JSON.
+    # 1) Verify signature on the raw bytes BEFORE parsing JSON. A bad
+    #    signature gets 401, never 410 (410 disables the webhook).
     if not verify_signature(req.headers.get("x-dovilo-signature", ""), raw_body):
         log.warning(
             "[webhook] rejected: invalid signature (delivery=%s)",
@@ -445,54 +517,62 @@ async def webhook(req: Request, bg: BackgroundTasks):
         log.info("[webhook] ping project=%s evt=%s", payload.get("projectId"), delivery_id)
         return {"ok": True, "pong": True}
 
+    if event_type not in ("task.created", "task.status_changed"):
+        log.warning("[webhook] unknown event: %s", event_type)
+        return {"ok": False, "reason": f"unknown event: {event_type}"}
+
+    task = payload.get("task") or {}
+    task_id = task.get("id")
+    if not task_id:
+        return {"ok": False, "reason": "missing task.id"}
+    status = task.get("status")
+    previous = payload.get("previousStatus")
+    project_name = payload.get("projectName")
+    TASK_STATE[task_id] = status or "unknown"
+
     if event_type == "task.created":
-        task = payload.get("task") or {}
-        if not task.get("id"):
-            return {"ok": False, "reason": "missing task.id"}
         log.info(
-            "[webhook] task.created id=%s text=%r priority=%s",
-            task["id"], task.get("text"), task.get("priority"),
+            "[webhook] task.created id=%s status=%s text=%r priority=%s",
+            task_id, status, task.get("text"), task.get("priority"),
         )
-        TASK_STATE[task["id"]] = task.get("status") or "queued"
-        # Process async — keep the webhook response fast.
-        bg.add_task(run_workflow, task)
-        return JSONResponse(status_code=202, content={"ok": True, "queued": task["id"]})
+        if status == "queued":
+            # Process async: keep the webhook response fast.
+            start_run(task, project_name, rerun_if_busy=False)
+            return JSONResponse(status_code=202, content={"ok": True, "queued": task_id})
+        if status == "scheduled":
+            # The agent cannot read a scheduled task; Dovilo queues it on time.
+            log.info("[webhook] task %s opens to the agent at %s", task_id, _fmt_ms(task.get("scheduledAt")))
+        return {"ok": True, "task_id": task_id, "status": status}
 
-    if event_type == "task.status_changed":
-        task = payload.get("task") or {}
-        new_status = task.get("status")
-        previous = payload.get("previousStatus")
-        task_id = task.get("id")
-        log.info(
-            "[webhook] task.status_changed id=%s %s -> %s",
-            task_id, previous, new_status,
-        )
-        if task_id:
-            TASK_STATE[task_id] = new_status or "unknown"
+    own = _OWN_STATUS.get(task_id) == status
+    if own:
+        del _OWN_STATUS[task_id]
+    log.info("[webhook] task.status_changed id=%s %s -> %s%s", task_id, previous, status, " (agent)" if own else "")
 
-        # Resume signal: the task was paused for user input and the user has
-        # now responded. Wake the agent again — it will re-read prior notes
-        # via get_task and pick up where it left off.
-        if (
-            task_id
-            and previous == "awaiting-user"
-            and new_status not in ("done", "failed", "cancelled")
-        ):
-            log.info("[webhook] resuming agent for task %s (user responded)", task_id)
-            bg.add_task(run_workflow, task)
+    # A task opens to the agent when it becomes `queued`: from `scheduled` when
+    # its time comes, from `awaiting-user` when the user answers or approves
+    # the plan, after Retry or Release in the app. Not when the agent itself
+    # handed it back: picking it straight up again could loop.
+    if status == "queued" and not own:
+        start_run(task, project_name, rerun_if_busy=True)
+        return JSONResponse(status_code=202, content={"ok": True, "queued": task_id})
 
-        return {"ok": True, "task_id": task_id, "status": new_status, "previous": previous}
+    # There is no `cancelled` status: a cancelled task is `error` + `cancelledAt`.
+    if status == "error" and task.get("cancelledAt") and not own:
+        log.info("[webhook] task %s was cancelled", task_id)
+        cancel_run(task_id)
 
-    log.warning("[webhook] unknown event: %s", event_type)
-    return {"ok": False, "reason": f"unknown event: {event_type}"}
+    return {"ok": True, "task_id": task_id, "status": status, "previous": previous}
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
     return {
         "ok": True,
+        "mcp_url": DOVILO_MCP_URL,
+        "mcp_tools": MCP_TOOLS,
         "tracked_tasks": TASK_STATE,
-        "mcp_tools": [t["name"] for t in dovilo.tool_schemas],
+        "agent_runs": sorted(_RUNS),
         "signature_verification": bool(DOVILO_WEBHOOK_SECRET),
         "dedup_size": len(_seen_set),
     }
