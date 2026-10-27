@@ -1,28 +1,44 @@
-# Dovilo Agentic Demo
+# Dovilo agentic demo
 
-Minimal LangGraph workflow that listens for [Dovilo](https://dovilo.app)
-webhooks and drives a Claude agent to process tasks, reporting progress
-through the [Dovilo MCP server](https://dovilo.app/ai/) running locally
-(`dovilo-mcp.exe`).
+Minimal LangGraph workflow that receives [Dovilo](https://dovilo.app)
+webhooks and drives a Claude agent to work AI tasks through the Dovilo
+Agents MCP at `https://dovilo.app/mcp/agents`.
 
 ```
-Dovilo Desktop ──HTTP webhook──▶ FastAPI :8000/webhook
-       ▲
-       └── stdio MCP ── this app spawns dovilo-mcp.exe and exposes its
-                        tools (get_task, list_tasks, update_status,
-                        update_step, append_note, ...) to Claude.
+Dovilo ──signed HTTPS webhook──▶ FastAPI :8000/webhook
+   ▲
+   └── Agents MCP over HTTPS, agent key as a Bearer token. The agent reads
+       the task, claims it, writes steps and notes, and sets the status
+       with the tools it exposes (get_task, read_context, update_status,
+       add_step, update_step, append_note, ...).
 ```
 
-The orchestrator only relays. The agent owns the lifecycle: claim (`update_status='running'`), work (`append_note`, `update_step`), finalize (`update_status='done' | 'failed' | 'cancelled'`).
+The orchestrator only relays. The agent owns the lifecycle: read
+(`read_context`, `get_task`), claim (`update_status='running'`), work
+(`add_step`, `update_step`, `append_note`), finish (`update_status='done'`,
+`'error'`, `'awaiting-user'` or `'cancelled'`).
 
 Single-file implementation in [main.py](main.py).
+
+> The [walkthrough video](https://www.youtube.com/watch?v=id_7T8qUfpg) shows
+> the Dovilo 1.8 setup, with a local MCP bridge on Desktop. It will be
+> re-recorded for the setup below.
+
+## What the agent can and cannot do
+
+- It sees only the AI tasks of the projects its agent is assigned to. It
+  never sees your personal tasks or other projects.
+- It can read those tasks and update them: status, steps, notes and
+  telemetry.
+- It cannot create or delete tasks. There is no create tool and no delete
+  tool.
+- It can cancel a task it should not run, with a reason. The task stays in
+  the list, shown as Cancelled. Cancelling is not deleting.
 
 ## Requirements
 
 - **Python 3.10+** and an [Anthropic API key](https://console.anthropic.com/).
-- **[Dovilo Desktop](https://github.com/slhddn/dovilo-desktop-releases/releases/latest)**
-  — it ships the `dovilo-mcp` binary this demo spawns, so there is nothing
-  separate to install. Desktop is part of Dovilo Pro, which starts with a
+- **Dovilo Pro**: agents and webhooks are part of Pro, which starts with a
   [7-day free trial](https://dovilo.app/downloads/).
 
 ## Setup
@@ -32,52 +48,84 @@ Single-file implementation in [main.py](main.py).
    pip install -r requirements.txt
    ```
 
-2. **Configure** — copy `.env.example` to `.env`, set `ANTHROPIC_API_KEY` and
-   `DOVILO_WEBHOOK_SECRET` (generate one in Dovilo: Project editor → Webhooks
-   → Generate signing secret — plaintext is shown only once; the payload and
-   signature spec is at
-   [dovilo.app/docs/webhooks](https://dovilo.app/docs/webhooks/)). Confirm
-   that [.mcp.json](.mcp.json) points at your local `dovilo-mcp.exe`.
+2. **Create an agent** in Dovilo: AI Agents > New agent (in Desktop,
+   Connect a new AI). Assign the project whose tasks it should work and copy
+   its key. The key is shown only once.
 
-3. **Run** — start the server, then in Dovilo set the webhook URL to
-   `http://localhost:8000/webhook` and subscribe to `task.created` and
-   `task.status_changed`.
+3. **Configure**: copy `.env.example` to `.env` and set `ANTHROPIC_API_KEY`
+   and `DOVILO_AGENT_KEY` (the key from step 2). `.env` is in `.gitignore`;
+   keep keys out of the repo.
+
+4. **Run**
    ```powershell
    python main.py
    ```
+   On startup the demo connects to the Agents MCP and works every task that
+   is already queued. If the key is missing, wrong or revoked, it stops and
+   prints Dovilo's message.
+
+5. **Add a webhook** so new tasks reach the demo without a restart. Dovilo's
+   server delivers to public HTTPS URLs, so expose port 8000 with a tunnel
+   (for example cloudflared or ngrok) and use
+   `https://<your-tunnel-host>/webhook`. Webhooks are set up in Dovilo
+   Desktop 2.0 or later: open the project's List settings, find Webhooks,
+   paste the URL, tick `task.created` and `task.status_changed`, switch it to
+   Enabled and save. Press Generate signing secret (shown once), put it in
+   `.env` as `DOVILO_WEBHOOK_SECRET`, restart the demo and press Send test.
+   Desktop does not need to stay open for a public URL. A
+   `http://localhost:8000/webhook` URL also works, but then Desktop delivers
+   the events and has to stay open. The payload and signature spec is at
+   [dovilo.app/docs/webhooks](https://dovilo.app/docs/webhooks/).
 
 ## How it works
 
-- **Startup**: spawns `dovilo-mcp.exe` as a stdio subprocess, fetches the
-  MCP tool list, then does a one-shot sync — calls `list_tasks` (or the
-  tool named by `DOVILO_LIST_TASKS_TOOL`) and queues every `queued` task
-  for the agent.
+- **Startup**: connects to the Agents MCP, lists its tools, then calls
+  `list_tasks` with `status: queued` and starts an agent run for each task.
 - **Webhooks** are HMAC-verified (`X-Dovilo-Signature`, 5-minute replay
   window) and deduped by `X-Dovilo-Delivery` before any processing. Invalid
-  signatures get `401`; duplicate deliveries are acknowledged without
-  re-running.
-- **`task.created`** → queue the agent for that task (`202 Accepted`,
-  processing happens in the background).
-- **`task.status_changed`** → log + update the in-memory status map.
-  Includes the agent's own `update_status` calls round-tripping back.
-- **Agent loop**: Claude runs a tool_use loop with the MCP tools as its
-  toolset. It calls `get_task` if it needs the full task body (webhook
-  payloads are slim by design), `append_note` for progress, and
-  `update_status` to finalize. The host process never sets status itself.
+  signatures get `401`, never `410` (a `410` disables the webhook).
+  Duplicate deliveries are acknowledged without re-running.
+- **A task opens to the agent when it becomes `queued`**:
+  - `task.created` with status `queued` starts a run (`202 Accepted`,
+    processing happens in the background).
+  - `task.status_changed` to `queued` starts a run: a scheduled task whose
+    time has come (`scheduled` to `queued`), a question the user answered or
+    a plan they approved (`awaiting-user` to `queued`), or a Retry in the
+    app.
+  - A task created for a later time arrives as `scheduled`. The demo logs
+    it and waits: the agent cannot read a scheduled task until Dovilo
+    queues it.
+  - A cancelled task arrives as `error` with `cancelledAt`. If an agent run
+    is working that task, the demo stops it.
+  - Other status changes, including the agent's own `update_status` calls
+    round-tripping back, are logged.
+- **Agent run**: opens its own connection to the Agents MCP (the endpoint
+  is stateless) and runs Claude in a tool_use loop with the MCP tools as its
+  toolset. The system prompt carries the agent protocol the server sends on
+  connect: read the task first, claim it with `update_status`, write steps
+  and notes, finish with a status. The agent reads before it claims, so it
+  does not claim a task it will not work. The host process never sets
+  status itself.
 
-`GET /health` reports tracked tasks, available MCP tools, whether signature
-verification is active, and the dedup buffer size.
+`GET /health` reports the MCP endpoint and its tools, tracked tasks, agent
+runs in flight, whether signature verification is active, and the dedup
+buffer size.
 
 ## Notes
 
 - If `DOVILO_WEBHOOK_SECRET` is missing, signature verification is **off**
   and a loud warning is logged at startup. Fine for local development,
   not for anything else.
-- Status values follow Dovilo's lifecycle: `queued → running →
-  awaiting-user → running → done | failed | cancelled`.
+- Statuses: `scheduled`, `queued`, `running`, `awaiting-user`, `done`,
+  `done-with-errors`, `error`. There is no `cancelled` status: a cancelled
+  task is stored as `error` with `cancelledAt` and shown as Cancelled.
+- A task counts against your monthly AI task quota when it opens to the
+  agent, not when the agent claims it. Answering the agent's question costs
+  no quota.
+- `DOVILO_MCP_URL` overrides the endpoint. It defaults to
+  `https://dovilo.app/mcp/agents`.
 
 ---
 
 [Dovilo](https://dovilo.app) · [AI & MCP integration](https://dovilo.app/ai/) ·
-[Webhook docs](https://dovilo.app/docs/webhooks/) ·
-[Desktop releases](https://github.com/slhddn/dovilo-desktop-releases)
+[Webhook docs](https://dovilo.app/docs/webhooks/)
